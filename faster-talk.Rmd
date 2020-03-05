@@ -95,6 +95,45 @@ color_gradient <- function(x, colors = c("#e8554e", "#ffd265", "#2aa876"), colst
   colorRampPalette(colors)(colsteps)[findInterval(x, seq(min(x, na.rm = TRUE), max(x, na.rm = TRUE), length.out = colsteps))]
 
 pretty_bytes_sec <- function(x) paste0(prettyunits::pretty_bytes(x, style="6"), "/s")
+
+fix_names <- function(d) {
+  n <- stringr::str_replace(names(d), "^(speed|RAM|filesize|read|write)_", "")
+  n[n == "tickets2018"] <- "tickets"
+  n[n == "nycflights"] <- "flights"
+  names(d) <- n
+  d
+}
+files <- list.files("results", ".qs$", full.names = TRUE)
+df_raw <- map_dfr(files, qs::qread) %>%
+  rename(Library = library, Fileformat = filetype) %>% 
+  filter(dataset %in% data_select)
+
+od <- c("tiny" = 1, "small" = 2, "wide" = 3, "medium" = 4, "large" = 5, "nycflights" = 6, "tickets2018" = 7)
+obj_sizes <- df_raw %>% 
+  group_by(dataset) %>% 
+  summarise(object_size = mean(object_size),
+            file_bytes = prettyunits::pretty_bytes(object_size, style = "6")) %>% 
+  mutate(idx = od[dataset]) %>% 
+  arrange(idx)
+
+order <- tibble(
+  Library = c("base", "readr", "data.table", "vroom", "base", "readr", "fst",
+              "qs", "feather", "arrow", "arrow", "arrow"), 
+Fileformat = c(".csv", ".csv", ".csv", ".csv", ".rds", ".rds", ".fst", 
+               ".qs", ".feather", ".feather", ".arrow", ".parquet"), 
+  id = 1:12)
+
+df <- df_raw %>% 
+  filter(is.na(compression)) %>% 
+  group_by(Library, Fileformat, dataset, operation) %>% 
+  summarise(speed = mean(time), RAM = mean(mem_alloc), filesize = mean(filesize)) %>%
+  ungroup() %>% 
+  mutate(Library = ifelse(Library == "datatable", "data.table", Library),
+         Fileformat = paste0(".", Fileformat),
+         speed = ifelse(Library == "vroom" & operation == "read", NA, speed),
+         RAM = ifelse(Library == "vroom" & operation == "read", NA, RAM)) %>% 
+  left_join(order, by = c("Library", "Fileformat")) %>% 
+  arrange(id) %>% select(-id)
 ```
 
 
@@ -102,7 +141,7 @@ pretty_bytes_sec <- function(x) paste0(prettyunits::pretty_bytes(x, style="6"), 
 
 --
 
-Or
+### Or
 
 ## WHAT? ... you still use read.csv?
 
@@ -174,7 +213,11 @@ class: center, middle, inverse
 
 --
 
-# ... its complicated
+# qs
+
+--
+
+# ... but, its more complicated
 
 ---
 
@@ -199,10 +242,10 @@ depends on ...
 - **shape** (long, wide)
 - **type** (string, int, numeric, lists in dataframes)
 
-\+
+`+`
 
 ### Additional factors
-- Python **compatablity**/file formats
+- Python **compatiblity**/file formats
 - **Dependency** weight
 - **Partial read** (row / column wise)
 - Support of **nested data-frames**
@@ -222,31 +265,31 @@ I want to ...
 <table style="width:100%;">
   <tr>
     <th style="text-align: left;"><li> have the <strong>fastest</strong> read/writes: </li></th>
-    <th style="text-align: left;"><code> asd </code></th>
-  </tr>
-  <tr>
-    <th style="text-align: left;"><li> have the smallest <strong>filesize on disk</strong>: </li></th>
-    <th style="text-align: left;"><code> asd </code></th>
+    <th style="text-align: left;"><code> fst </code></th>
   </tr>
   <tr>
     <th style="text-align: left;"><li> have the smallest <strong>RAM usage</strong>: </li></th>
-    <th style="text-align: left;"><code> asd </code></th>
+    <th style="text-align: left;"><code> qs </code></th>
+  </tr>
+  <tr>
+    <th style="text-align: left;"><li> have the smallest <strong>filesize on disk</strong>: </li></th>
+    <th style="text-align: left;"><code> qs </code> or <code>base->rds</code> (slow...)</th>
   </tr>
   <tr>
     <th style="text-align: left;"><li> <strong>communicate</strong> with everything: </li></th>
-    <th style="text-align: left;"><code> asd </code></th>
+    <th style="text-align: left;"><code> data.table </code></th>
   </tr>
   <tr>
     <th style="text-align: left;"><li> have light <strong>dependencies</strong>: </li></th>
-    <th style="text-align: left;"><code>base->csv</code> or <code>data.table->csv</code></th>
+    <th style="text-align: left;"><code>base</code> or <code>data.table</code></th>
   </tr>
   <tr>
     <th style="text-align: left;"><li> also use it in <strong>python</strong>: </li></th>
-    <th style="text-align: left;"><code> asd </code></th>
+    <th style="text-align: left;"><code> arrow->feather </code></th>
   </tr>
   <tr>
     <th style="text-align: left;"><li>  use <strong>nested dataframes</strong>: </li></th>
-    <th style="text-align: left;"><code>*->rds</code> or <code>qs->qs</code></th>
+    <th style="text-align: left;"><code>qs</code></th>
   </tr>
 </table>
     
@@ -261,30 +304,49 @@ deps
 
 .smaller[
 ```{r, echo=FALSE}
+mults <- df_raw %>% 
+  filter(is.na(compression)) %>% 
+   select(Library:compression, 
+         speed = time, RAM = mem_alloc, filesize) %>% 
+  group_by(operation, dataset) %>%
+  mutate(RAM = RAM + 1) %>% # avoid div/0
+  mutate_at(vars(speed, RAM, filesize), list(mult = ~.x/min(.x))) %>% 
+  group_by(Library, Fileformat) %>% 
+  summarise_at(vars(ends_with("_mult")), mean, na.rm = TRUE) %>% 
+  ungroup() %>% 
+  select(Library, Fileformat, Speed = speed_mult, RAM = RAM_mult, Filesize = filesize_mult) %>% 
+  mutate(Fileformat = paste0(".", Fileformat),
+         Library = ifelse(Library == "datatable", "data.table", Library)) %>% 
+  mutate_at(vars(Speed, RAM, Filesize), list(~ifelse(Library == "vroom", NA, .x)))
+
 # 0 -> NO, 1 -> YES, 2 -> Best in Class, 9 -> unclear/future (maybe), 3 -> row only random access
 # Dependencies: 0: best in class, 1: some=good, 2: many=bad
 # Speed, RAM, size: 0: best in class ("medal"), 1: good, 2: average, 3: bad
 spec_res <- tribble(
-  ~Library, ~Fileformat, ~Multicore, ~`Nested DFs`, ~Python, ~`Random Access`, ~Dependencies, ~Speed, ~RAM, ~Filesize,
-  "base",        ".csv",      FALSE,         FALSE,       1,                0,             0,     NA,   NA,        1,
-  "readr",       ".csv",      FALSE,         FALSE,       1,                0,             2,     NA,   NA,        1,
-  "data.table",  ".csv",       TRUE,         FALSE,       1,                3,             2,     NA,   NA,        2,
-  "vroom",       ".csv",       TRUE,         FALSE,       1,                3,             0,     NA,   NA,        3,
-  "base",        ".rds",      FALSE,          TRUE,       0,                0,             2,     NA,   NA,        4,   
-  "readr",       ".rds",      FALSE,          TRUE,       0,                0,             2,     NA,   NA,        5,
-  "fst",         ".fst",       TRUE,         FALSE,       9,                2,             1,     NA,   NA,        6,
-  "qs",           ".qs",       TRUE,          TRUE,       0,                0,             1,     NA,   NA,        7,
-  "feather", ".feather",      FALSE,         FALSE,       1,                0,             1,     NA,   NA,        8,
-  "arrow",   ".feather",      FALSE,         FALSE,       1,                3,             2,     NA,   NA,        9,
-  "arrow",     ".arrow",      FALSE,         FALSE,       1,                0,             2,     NA,   NA,        10,
-  "arrow",   ".parquet",      FALSE,         FALSE,       1,                3,             2,     NA,   NA,        11
-)
+  ~Library, ~Fileformat, ~Multicore, ~`Nested DFs`, ~Python, ~`Random Access`, ~Dependencies,
+  "base",        ".csv",      FALSE,         FALSE,       1,                0,             0,
+  "readr",       ".csv",      FALSE,         FALSE,       1,                0,             2,
+  "data.table",  ".csv",       TRUE,         FALSE,       1,                3,             0,
+  "vroom",       ".csv",       TRUE,         FALSE,       1,                3,             2,
+  "base",        ".rds",      FALSE,          TRUE,       0,                0,             0,
+  "readr",       ".rds",      FALSE,          TRUE,       0,                0,             2,
+  "fst",         ".fst",       TRUE,         FALSE,       9,                2,             1,
+  "qs",           ".qs",       TRUE,          TRUE,       0,                0,             1,
+  "feather", ".feather",      FALSE,         FALSE,       1,                0,             1,
+  "arrow",   ".feather",      FALSE,         FALSE,       1,                3,             2,
+  "arrow",     ".arrow",      FALSE,         FALSE,       1,                0,             2,
+  "arrow",   ".parquet",      FALSE,         FALSE,       1,                3,             2
+  ) %>% 
+  left_join(mults, by = c("Library", "Fileformat"))
 
 # maps that say how values are decoded to fontawesome glyphs
 python_map <- c("0" = NA, "1" = "check", "9" = "question")
 ra_map <- c("0" = NA, "2" = "crown", "3" = "angle-down")
 dep_map <- c("0" = "crown", "1" = "thumbs-up", "2" = "hand-point-right")
 fac_map <- c("0" = "crown", "1" = "thumbs-up", "2" = "hand-point-right", "3" = "thumbs-down")
+rank_map <- function(x) x %>% percent_rank() %>% {ifelse(. < 0.01, "crown", 
+                                                        ifelse(. < 0.3, "thumbs-up",
+                                                               ifelse(. < 0.7, "hand-point-right", "thumbs-down")))} %>% fa()
 
 spec_res %>% 
   mutate(
@@ -295,7 +357,9 @@ spec_res %>%
     Python = fa_map(Python, python_map),
     `Random Access` = fa_map(`Random Access`, ra_map),
     Dependencies = fa_map(Dependencies, dep_map),
-    Filesize = color_tile_fix(Filesize, red_to_green, f = prettyunits::pretty_bytes)
+    Speed = color_tile_fix(Speed, rev(red_to_green), f = rank_map),
+    RAM = color_tile_fix(RAM, rev(red_to_green), log_fmt = TRUE, f = rank_map),
+    Filesize = color_tile_fix(Filesize, rev(red_to_green), f = rank_map)
     ) %>% 
   kable(escape = FALSE, align = "lrccccclll") %>%
   kable_styling() %>% 
@@ -306,6 +370,7 @@ spec_res %>%
 ```
 ]
 
+.smaller[Note that `vroom` is not properly benchmarked, due to lazy loading(?!)]
 
 ---
 # Special Mentions & Remarks
@@ -340,14 +405,20 @@ qsave(tickets, "tickets.qs", preset = "archive")
 ### Remarks
 
 .smaller[
+- `vroom` loads the data only lazily, resulting in inaccurate measurements (i.e., 2 MB when GBs where used on the machine), it is a lot better than these benchmarks suggest.
+]
+
+--
+
+.smaller[
 - `qs` allows multicore, but default is to only use 1, for using all available cores, use
 
 ```r
 qs::qread("myfile.qs", nthrads = parallel::detectCores())
 ```
 
-This reduces the time for archiving the tickets to 
 ]
+
 
 ---
 class: center, middle, inverse
@@ -356,7 +427,7 @@ class: center, middle, inverse
 
 --
 
-# OK, ok, BUT I still want the details...
+# ... OK, ok, BUT I still want the details...
 
 ### see following slides
 ---
@@ -364,39 +435,6 @@ class: center, middle, inverse
 ### Average Speed
 .smallish[
 ```{r, echo=FALSE, warning=FALSE}
-fix_names <- function(d) {
-  n <- stringr::str_replace(names(d), "^(speed|RAM|filesize|read|write)_", "")
-  n[n == "tickets2018"] <- "tickets"
-  n[n == "nycflights"] <- "flights"
-  names(d) <- n
-  d
-}
-files <- list.files("results", ".qs$", full.names = TRUE)
-df_raw <- map_dfr(files, qs::qread) %>%
-  rename(Library = library, Fileformat = filetype) %>% 
-  filter(dataset %in% data_select)
-
-order <- spec_res %>% select(Library, Fileformat) %>% mutate(id = 1:n())
-
-od <- c("tiny" = 1, "small" = 2, "wide" = 3, "medium" = 4, "large" = 5, "nycflights" = 6, "tickets2018" = 7)
-obj_sizes <- df_raw %>% 
-  group_by(dataset) %>% 
-  summarise(object_size = mean(object_size),
-            file_bytes = prettyunits::pretty_bytes(object_size, style = "6")) %>% 
-  mutate(idx = od[dataset]) %>% 
-  arrange(idx)
-
-
-df <- df_raw %>% 
-  filter(is.na(compression)) %>% 
-  group_by(Library, Fileformat, dataset, operation) %>% 
-  summarise(speed = mean(time), RAM = mean(mem_alloc), filesize = mean(filesize)) %>%
-  ungroup() %>% 
-  mutate(Library = ifelse(Library == "datatable", "data.table", Library),
-         Fileformat = paste0(".", Fileformat)) %>% 
-  left_join(order, by = c("Library", "Fileformat")) %>% 
-  arrange(id) %>% select(-id)
-
 ll <- list(speed    = df %>% select(Library:operation, val = speed),
            RAM      = df %>% select(Library:operation, val = RAM),
            filesize = df %>% select(Library:operation, val = filesize)) %>%
@@ -444,7 +482,7 @@ ll$speed %>%
 ```
 ]
 
-.smaller[Note that all comparisons are performed without compression]
+.smaller[Note that all comparisons are performed without compression. Also, note that `vroom` benchmarks are not accurate for read-operations]
 
 ---
 ### Average RAM Usage
@@ -474,7 +512,7 @@ ll$RAM %>%
 ```
 ]
 
-.smaller[Note that all comparisons are performed without compression]
+.smaller[Note that all comparisons are performed without compression. Also, note that `vroom` benchmarks are not accurate for read-operations]
 ---
 ### Average Filesize
 .smallish[
