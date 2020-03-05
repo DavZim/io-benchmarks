@@ -1,0 +1,756 @@
+---
+title: "Fast, Faster, ???"
+subtitle: "Comparing Data Read/Write Speeds in R"
+author: "David Zimmermann"
+institute: "R User Group Cologne"
+date: "2020-03-05 @ Cologne Intelligence"
+output:
+  xaringan::moon_reader:
+    lib_dir: libs
+    css: xaringan-themer.css
+    nature:
+      highlightStyle: github
+      highlightLines: true
+      countIncrementalSlides: false
+---
+class: center, middle, inverse
+
+```{r xaringan-themer, include = FALSE}
+knitr::opts_chunk$set(cache = TRUE)
+library(xaringanthemer)
+suppressPackageStartupMessages(library(tidyverse))
+library(kableExtra)
+library(fontawesome)
+library(formattable)
+
+duo(
+  primary_color = "#1F4257", 
+  secondary_color = "#F97B64",
+  extra_css = list(
+    ".small" = list("font-size" = "80%"),
+    ".smaller" = list("font-size" = "67%"),
+    ".smallish" = list("font-size" = "60%"),
+    ".smallest" = list("font-size" = "50%"),
+    ".tiny" = list("font-size" = "20%"),
+    ".scroll-output" = list("height" = "55em", "overflow-y" = "scroll"),
+    ".remark-slide table" = list("border-bottom" = "none", "border-top" = "none", "width" = "100%"),
+    ".move-upwards" = list("margin-top" = "-50px")
+  ),
+  table_border_color = "gray",
+  table_row_border_color = "lightgray",
+  table_row_even_background_color = NA,
+  header_font_google = google_font("Josefin Sans"),
+  text_font_google   = google_font("Montserrat", "300", "300i"),
+  code_font_google   = google_font("Droid Mono")
+)
+
+options(htmltools.dir.version = FALSE)
+
+# which datasets do we compare?
+data_select <- c("tiny", "wide", "large", "nycflights", "tickets2018")
+
+f_check <- function(x) map_chr(x, ~ifelse(is.na(.x) | .x != TRUE, "", as.character(fa("check", fill = "white"))))
+
+# wraps something in code tags
+as_code <- function(x) paste0("<code>", x, "</code>") 
+
+# maps a vector of values to a map of fontawesome signs
+fa_map <- function(x, map) {
+  xx <- as.character(x)
+  r <- map[xx]
+  as.character(map_chr(r, ~ifelse(is.na(.x), "", fontawesome::fa(.x, fill = "white"))))
+}
+
+# override fa to accomodate vectors of x
+fa <- function(x, height = NULL, fill = NULL) purrr::map_chr(x, ~fontawesome::fa(.x, height = height, fill = fill))
+
+# formattable::color_tile but with the option to specify a function that is applied afterwards
+color_tile_fix <- function(x, 
+                           bg_colors = c("#e8554e", "#ffd265", "#2aa876"), 
+                           font_colors = "black", 
+                           font_size = 1, # in em
+                           log_fmt = FALSE,
+                           f = NA) {
+  txt <- "<span style=\"display: block; width:100%;height:100%; font-size: {font_size}em; padding: 0 4px; border-radius: 4px; background-color: {bg_col}; color: {ft_col};\">{val}</span>"
+  
+  if (log_fmt) x <- log(x)
+  
+  bg_cols <- color_gradient(x, bg_colors)
+  ft_cols <- color_gradient(x, font_colors)
+  
+  if (is.function(f)) {
+    if (log_fmt) {
+      x <- f(exp(x))
+    } else {
+      x <- f(x)
+    }
+  }
+  
+  purrr::pmap_chr(list(x, bg_cols, ft_cols), 
+                  function(val, bg_col, ft_col) glue::glue(txt))
+}
+
+red_to_green <- c("#e8554e", "#ffd265", "#2aa876")
+color_gradient <- function(x, colors = c("#e8554e", "#ffd265", "#2aa876"), colsteps = 100)
+  colorRampPalette(colors)(colsteps)[findInterval(x, seq(min(x, na.rm = TRUE), max(x, na.rm = TRUE), length.out = colsteps))]
+
+pretty_bytes_sec <- function(x) paste0(prettyunits::pretty_bytes(x, style="6"), "/s")
+```
+
+
+# How can we write and read data in R efficiently?
+
+--
+
+Or
+
+## WHAT? ... you still use read.csv?
+
+---
+
+# Soooo many options...
+
+.pull-left[
+## Filetypes
+- `.csv`
+- `.rds`
+- `.fst`
+- `.qs`
+- `.feather`
+- `.arrow`
+- `.parquet`
+]
+--
+.pull-right[
+## R packages
+- `base`
+- `readr`
+- `data.table`
+- `vroom`
+- `fst`
+- `qs`
+- `feather`
+- `arrow`
+]
+
+--
+
+**+** different compression levels
+
+---
+
+# Multitude of wonderful packages
+
+```{r, echo=F}
+libs <- tribble(~Library, ~format,
+             "base", "csv",
+             "base", "rds",
+             "readr", "csv",
+             "readr", "rds",
+             "data.table", "csv",
+             "vroom", "csv",
+             "fst", "fst",
+             "qs", "qs",
+             "feather", "feather",
+             "arrow", "feather",
+             "arrow", "arrow",
+             "arrow", "parquet") %>% 
+  mutate(format = paste0("<code>.", format, "</code>"), val = TRUE) %>% 
+  pivot_wider(names_from = format, values_from = val, values_fill = list(val = FALSE)) %>% 
+  mutate(Library = as_code(Library)) %>%
+  mutate_at(vars(-one_of("Library")), f_check) %>% 
+  select(Library, everything())
+
+libs %>%
+  kable(escape = FALSE, align = "lcccccccc") %>%
+  kable_styling() %>% 
+  add_header_above(c(" ", "Filetypes" = 7))
+```
+
+
+---
+class: center, middle, inverse
+# And the winner is?
+
+--
+
+# ... its complicated
+
+---
+
+# The many factors to consider
+
+.pull-left[
+
+### Factors to consider
+- **RAM** usage
+- Read/Write **speed**
+- **Filesize**
+
+depends on ... 
+]
+
+--
+
+.pull-right[
+
+### Type of data
+- **size** (KBs, MBs, GBs)
+- **shape** (long, wide)
+- **type** (string, int, numeric, lists in dataframes)
+
+\+
+
+### Additional factors
+- Python **compatablity**/file formats
+- **Dependency** weight
+- **Partial read** (row / column wise)
+- Support of **nested data-frames**
+
+]
+
+---
+class: center, middle, inverse
+
+# Just give me one option to use!
+
+---
+# The Real Winner is
+
+I want to ...
+
+<table style="width:100%;">
+  <tr>
+    <th style="text-align: left;"><li> have the <strong>fastest</strong> read/writes: </li></th>
+    <th style="text-align: left;"><code> asd </code></th>
+  </tr>
+  <tr>
+    <th style="text-align: left;"><li> have the smallest <strong>filesize on disk</strong>: </li></th>
+    <th style="text-align: left;"><code> asd </code></th>
+  </tr>
+  <tr>
+    <th style="text-align: left;"><li> have the smallest <strong>RAM usage</strong>: </li></th>
+    <th style="text-align: left;"><code> asd </code></th>
+  </tr>
+  <tr>
+    <th style="text-align: left;"><li> <strong>communicate</strong> with everything: </li></th>
+    <th style="text-align: left;"><code> asd </code></th>
+  </tr>
+  <tr>
+    <th style="text-align: left;"><li> have light <strong>dependencies</strong>: </li></th>
+    <th style="text-align: left;"><code>base->csv</code> or <code>data.table->csv</code></th>
+  </tr>
+  <tr>
+    <th style="text-align: left;"><li> also use it in <strong>python</strong>: </li></th>
+    <th style="text-align: left;"><code> asd </code></th>
+  </tr>
+  <tr>
+    <th style="text-align: left;"><li>  use <strong>nested dataframes</strong>: </li></th>
+    <th style="text-align: left;"><code>*->rds</code> or <code>qs->qs</code></th>
+  </tr>
+</table>
+    
+```{r dependencies, include=FALSE, cache=TRUE}
+pkgs <- c("base", "readr", "data.table", "vroom", "qs", "fst", "feather", "arrow")
+deps <- tools::package_dependencies(pkgs, recursive = TRUE)
+deps
+```
+
+---
+### Summary
+
+.smaller[
+```{r, echo=FALSE}
+# 0 -> NO, 1 -> YES, 2 -> Best in Class, 9 -> unclear/future (maybe), 3 -> row only random access
+# Dependencies: 0: best in class, 1: some=good, 2: many=bad
+# Speed, RAM, size: 0: best in class ("medal"), 1: good, 2: average, 3: bad
+spec_res <- tribble(
+  ~Library, ~Fileformat, ~Multicore, ~`Nested DFs`, ~Python, ~`Random Access`, ~Dependencies, ~Speed, ~RAM, ~Filesize,
+  "base",        ".csv",      FALSE,         FALSE,       1,                0,             0,     NA,   NA,        1,
+  "readr",       ".csv",      FALSE,         FALSE,       1,                0,             2,     NA,   NA,        1,
+  "data.table",  ".csv",       TRUE,         FALSE,       1,                3,             2,     NA,   NA,        2,
+  "vroom",       ".csv",       TRUE,         FALSE,       1,                3,             0,     NA,   NA,        3,
+  "base",        ".rds",      FALSE,          TRUE,       0,                0,             2,     NA,   NA,        4,   
+  "readr",       ".rds",      FALSE,          TRUE,       0,                0,             2,     NA,   NA,        5,
+  "fst",         ".fst",       TRUE,         FALSE,       9,                2,             1,     NA,   NA,        6,
+  "qs",           ".qs",       TRUE,          TRUE,       0,                0,             1,     NA,   NA,        7,
+  "feather", ".feather",      FALSE,         FALSE,       1,                0,             1,     NA,   NA,        8,
+  "arrow",   ".feather",      FALSE,         FALSE,       1,                3,             2,     NA,   NA,        9,
+  "arrow",     ".arrow",      FALSE,         FALSE,       1,                0,             2,     NA,   NA,        10,
+  "arrow",   ".parquet",      FALSE,         FALSE,       1,                3,             2,     NA,   NA,        11
+)
+
+# maps that say how values are decoded to fontawesome glyphs
+python_map <- c("0" = NA, "1" = "check", "9" = "question")
+ra_map <- c("0" = NA, "2" = "crown", "3" = "angle-down")
+dep_map <- c("0" = "crown", "1" = "thumbs-up", "2" = "hand-point-right")
+fac_map <- c("0" = "crown", "1" = "thumbs-up", "2" = "hand-point-right", "3" = "thumbs-down")
+
+spec_res %>% 
+  mutate(
+    Library = as_code(Library),
+    Fileformat = as_code(Fileformat),
+    Multicore = f_check(Multicore),
+    `Nested DFs` = f_check(`Nested DFs`),
+    Python = fa_map(Python, python_map),
+    `Random Access` = fa_map(`Random Access`, ra_map),
+    Dependencies = fa_map(Dependencies, dep_map),
+    Filesize = color_tile_fix(Filesize, red_to_green, f = prettyunits::pretty_bytes)
+    ) %>% 
+  kable(escape = FALSE, align = "lrccccclll") %>%
+  kable_styling() %>% 
+  pack_rows("Plain Text", 1, 4) %>%
+  pack_rows("R specific", 5, 8) %>%
+  pack_rows("Arrow-based", 9, 12) %>%
+  add_header_above(c(" " = 2, "Capabilities" = 5, "Factors" = 3))
+```
+]
+
+
+---
+# Special Mentions & Remarks
+
+### Special Mentions
+.smaller[
+- `data.table` for its use of pipes: (search all `.csv.gz` archives for the line `rug-meetup` and load only those lines)
+
+```r
+fread(cmd = "cat *.csv.gz | gunzip | grep -e rug-meetup")
+``` 
+]
+
+--
+
+.smaller[
+- `vroom` for its excellent functionality and performance with strings
+]
+
+--
+
+.smaller[
+- `qs` for its excellent compression, i.e., `preset="archive"` reduces the `tickets` dataset from 3.4 GB in `R` to 278 MB (!) on disk in ~3 mins or in 12 secs to 580 MB with `preset="balanced"`
+
+```r
+qsave(tickets, "tickets.qs", preset = "archive")
+```
+]
+
+--
+
+### Remarks
+
+.smaller[
+- `qs` allows multicore, but default is to only use 1, for using all available cores, use
+
+```r
+qs::qread("myfile.qs", nthrads = parallel::detectCores())
+```
+
+This reduces the time for archiving the tickets to 
+]
+
+---
+class: center, middle, inverse
+
+# Thats it for today
+
+--
+
+# OK, ok, BUT I still want the details...
+
+### see following slides
+---
+
+### Average Speed
+.smallish[
+```{r, echo=FALSE, warning=FALSE}
+fix_names <- function(d) {
+  n <- stringr::str_replace(names(d), "^(speed|RAM|filesize|read|write)_", "")
+  n[n == "tickets2018"] <- "tickets"
+  n[n == "nycflights"] <- "flights"
+  names(d) <- n
+  d
+}
+files <- list.files("results", ".qs$", full.names = TRUE)
+df_raw <- map_dfr(files, qs::qread) %>%
+  rename(Library = library, Fileformat = filetype) %>% 
+  filter(dataset %in% data_select)
+
+order <- spec_res %>% select(Library, Fileformat) %>% mutate(id = 1:n())
+
+od <- c("tiny" = 1, "small" = 2, "wide" = 3, "medium" = 4, "large" = 5, "nycflights" = 6, "tickets2018" = 7)
+obj_sizes <- df_raw %>% 
+  group_by(dataset) %>% 
+  summarise(object_size = mean(object_size),
+            file_bytes = prettyunits::pretty_bytes(object_size, style = "6")) %>% 
+  mutate(idx = od[dataset]) %>% 
+  arrange(idx)
+
+
+df <- df_raw %>% 
+  filter(is.na(compression)) %>% 
+  group_by(Library, Fileformat, dataset, operation) %>% 
+  summarise(speed = mean(time), RAM = mean(mem_alloc), filesize = mean(filesize)) %>%
+  ungroup() %>% 
+  mutate(Library = ifelse(Library == "datatable", "data.table", Library),
+         Fileformat = paste0(".", Fileformat)) %>% 
+  left_join(order, by = c("Library", "Fileformat")) %>% 
+  arrange(id) %>% select(-id)
+
+ll <- list(speed    = df %>% select(Library:operation, val = speed),
+           RAM      = df %>% select(Library:operation, val = RAM),
+           filesize = df %>% select(Library:operation, val = filesize)) %>%
+  # pivot values to wider
+  map(
+  ~pivot_wider(.x, Library:operation, names_from = dataset, values_from = val) %>%
+    select(Library, Fileformat, operation, one_of(data_select))
+  ) %>% 
+  # split read/write
+  map(function(data) {
+    split <- split(data, data$operation)
+    
+    split[["read"]] <- split[["read"]] %>% 
+      rename_at(vars(one_of(data_select)), ~paste0("read_", .x)) %>%
+      select(-operation)
+    
+    split[["write"]] <- split[["write"]] %>% 
+      rename_at(vars(one_of(data_select)), ~paste0("write_", .x)) %>% 
+      select(-operation)
+    
+    Reduce(function(x, y) left_join(x, y, by = c("Library", "Fileformat")), split)
+  })
+
+ll$speed %>%
+  mutate_if(is.numeric,
+            ~color_tile_fix(.x, rev(red_to_green), 
+                            font_colors = "black", font_size = 0.75, 
+                            log_fmt = TRUE,
+                            f = prettyunits::pretty_sec)) %>%
+  mutate(Library = as_code(Library)) %>%
+  fix_names() %>%
+  set_names(c("Library", "Fileformat", rep(obj_sizes$file_bytes, 2))) %>% 
+  kable(escape = FALSE, align = "lrllllllllllllllllllllll") %>%
+  kable_styling("hover", full_width = TRUE) %>%
+  pack_rows("Plain Text", 1, 4, bold = TRUE) %>%
+  pack_rows("R specific", 5, 8, bold = TRUE) %>%
+  pack_rows("Arrow-based", 9, 12, bold = TRUE) %>%
+  add_header_above(c(" " = 2,
+                     "tiny" = 1, "wide" = 1, "large" = 1, "flights" = 1, "tickets" = 1,
+                     "tiny" = 1, "wide" = 1, "large" = 1, "flights" = 1, "tickets" = 1)) %>%
+  add_header_above(c(" " = 2, 
+                     "Read" = length(data_select),
+                     "Write" = length(data_select))) %>%
+  column_spec(c(1, 2), bold = TRUE)
+```
+]
+
+.smaller[Note that all comparisons are performed without compression]
+
+---
+### Average RAM Usage
+.smallish[
+```{r, echo=FALSE}
+ll$RAM %>%
+  mutate_if(is.numeric,
+            ~color_tile_fix(.x + 1, rev(red_to_green), 
+                            font_colors = "black", font_size = 0.75, 
+                            log_fmt = TRUE,
+                            f = function(x) prettyunits::pretty_bytes(x, style="6"))) %>%
+  mutate(Library = as_code(Library)) %>%
+  fix_names() %>%
+  set_names(c("Library", "Fileformat", rep(obj_sizes$file_bytes, 2))) %>% 
+  kable(escape = FALSE, align = "lrllllllllllllllllllllll") %>%
+  kable_styling("hover", full_width = TRUE) %>%
+  pack_rows("Plain Text", 1, 4, bold = TRUE) %>%
+  pack_rows("R specific", 5, 8, bold = TRUE) %>%
+  pack_rows("Arrow-based", 9, 12, bold = TRUE) %>%
+  add_header_above(c(" " = 2,
+                     "tiny" = 1, "wide" = 1, "large" = 1, "flights" = 1, "tickets" = 1,
+                     "tiny" = 1, "wide" = 1, "large" = 1, "flights" = 1, "tickets" = 1)) %>%
+  add_header_above(c(" " = 2, 
+                     "Read" = length(data_select),
+                     "Write" = length(data_select))) %>%
+  column_spec(c(1, 2), bold = TRUE)
+```
+]
+
+.smaller[Note that all comparisons are performed without compression]
+---
+### Average Filesize
+.smallish[
+```{r, echo=FALSE}
+ll$filesize %>%
+  mutate_if(is.numeric,
+            ~color_tile_fix(.x + 1, rev(red_to_green), 
+                            font_colors = "black", font_size = 0.75, 
+                            log_fmt = TRUE,
+                            f = function(x) prettyunits::pretty_bytes(x - 1, style="6"))) %>%
+  mutate(Library = as_code(Library)) %>%
+  select(Library, Fileformat, starts_with("write")) %>% 
+  fix_names() %>%
+  set_names(c("Library", "Fileformat", obj_sizes$file_bytes)) %>% 
+  kable(escape = FALSE, align = "lrllllllllllllllllllllll") %>%
+  kable_styling("hover", full_width = TRUE) %>%
+  pack_rows("Plain Text", 1, 4, bold = TRUE) %>%
+  pack_rows("R specific", 5, 8, bold = TRUE) %>%
+  pack_rows("Arrow-based", 9, 12, bold = TRUE) %>%
+  add_header_above(c(" " = 2,
+                     "tiny" = 1, "wide" = 1, "large" = 1, "flights" = 1, "tickets" = 1)) %>%
+  column_spec(c(1, 2), bold = TRUE)
+```
+]
+.smaller[Note that all comparisons are performed without compression]
+---
+class: center, middle, inverse
+
+# What about compressions?
+
+---
+
+### Average Speed Compression
+.move-upwards[.smallish[
+```{r, echo=FALSE}
+df <- df_raw %>% 
+  filter(!is.na(compression)) %>% 
+  group_by(Library, Fileformat, dataset, operation, compression) %>% 
+  summarise(speed = mean(time), RAM = mean(mem_alloc), filesize = mean(filesize)) %>%
+  ungroup() %>% 
+  mutate(Library = ifelse(Library == "datatable", "data.table", Library),
+         Fileformat = paste0(".", Fileformat)) %>% 
+  left_join(order, by = c("Library", "Fileformat")) %>% 
+  arrange(id) %>% select(-id) %>% 
+  rename(Compression = compression)
+
+ll <- list(speed    = df %>% select(Library:Compression, val = speed),
+           RAM      = df %>% select(Library:Compression, val = RAM),
+           filesize = df %>% select(Library:Compression, val = filesize)) %>%
+  # pivot values to wider
+  map(
+  ~pivot_wider(.x, Library:Compression, names_from = dataset, values_from = val) %>%
+    select(Library, Fileformat, operation, Compression, one_of(data_select))
+  ) %>% 
+  # split read/write
+  map(function(data) {
+    split <- split(data, data$operation)
+    
+    split[["read"]] <- split[["read"]] %>% 
+      rename_at(vars(one_of(data_select)), ~paste0("read_", .x)) %>%
+      select(-operation)
+    
+    split[["write"]] <- split[["write"]] %>% 
+      rename_at(vars(one_of(data_select)), ~paste0("write_", .x)) %>% 
+      select(-operation)
+    
+    Reduce(function(x, y) left_join(x, y, by = c("Library", "Fileformat", "Compression")), split)
+  })
+
+ll$speed %>%
+  mutate_if(is.numeric,
+            ~color_tile_fix(.x, rev(red_to_green), 
+                            font_colors = "black", font_size = 0.75, 
+                            log_fmt = TRUE,
+                            f = prettyunits::pretty_sec)) %>%
+  mutate(Library = as_code(Library)) %>%
+  fix_names() %>%
+  set_names(c("Library", "Fileformat", "Compression", rep(obj_sizes$file_bytes, 2))) %>% 
+  kable(escape = FALSE, align = "lrrllllllllll") %>%
+  kable_styling("hover", full_width = TRUE) %>%
+  pack_rows("<code>base</code>", 1, 3, bold = TRUE, escape = FALSE) %>%
+  pack_rows("<code>readr</code>", 4, 7, bold = TRUE, escape = FALSE) %>%
+  pack_rows("<code>fst</code>", 8, 9, bold = TRUE, escape = FALSE) %>%
+  pack_rows("<code>qs</code>", 10, 12, bold = TRUE, escape = FALSE) %>%
+  add_header_above(c(" " = 3,
+                     "tiny" = 1, "wide" = 1, "large" = 1, "flights" = 1, "tickets" = 1,
+                     "tiny" = 1, "wide" = 1, "large" = 1, "flights" = 1, "tickets" = 1)) %>%
+  add_header_above(c(" " = 3, 
+                     "Read" = length(data_select),
+                     "Write" = length(data_select))) %>%
+  column_spec(c(1, 2, 3), bold = TRUE)
+```
+]]
+
+---
+### RAM Usage Compression
+.move-upwards[.smallish[
+```{r, echo=F}
+ll$RAM %>%
+  mutate_if(is.numeric,
+            ~color_tile_fix(.x + 1, rev(red_to_green), 
+                            font_colors = "black", font_size = 0.75, 
+                            log_fmt = TRUE,
+                            f = function(x) prettyunits::pretty_bytes(x - 1, style = "6"))) %>%
+  mutate(Library = as_code(Library)) %>%
+  fix_names() %>%
+  set_names(c("Library", "Fileformat", "Compression", rep(obj_sizes$file_bytes, 2))) %>% 
+  kable(escape = FALSE, align = "lrrllllllllll") %>%
+  kable_styling("hover", full_width = TRUE) %>%
+  pack_rows("<code>base</code>", 1, 3, bold = TRUE, escape = FALSE) %>%
+  pack_rows("<code>readr</code>", 4, 7, bold = TRUE, escape = FALSE) %>%
+  pack_rows("<code>fst</code>", 8, 9, bold = TRUE, escape = FALSE) %>%
+  pack_rows("<code>qs</code>", 10, 12, bold = TRUE, escape = FALSE) %>%
+  add_header_above(c(" " = 3,
+                     "tiny" = 1, "wide" = 1, "large" = 1, "flights" = 1, "tickets" = 1,
+                     "tiny" = 1, "wide" = 1, "large" = 1, "flights" = 1, "tickets" = 1)) %>%
+  add_header_above(c(" " = 3, 
+                     "Read" = length(data_select),
+                     "Write" = length(data_select))) %>%
+  column_spec(c(1, 2, 3), bold = TRUE)
+```
+]]
+
+---
+###  Average Filesize Compression
+.smallish[
+```{r, echo=F}
+ll$filesize %>%
+  mutate_if(is.numeric,
+            ~color_tile_fix(.x + 1, rev(red_to_green), 
+                            font_colors = "black", font_size = 0.75, 
+                            log_fmt = TRUE,
+                            f = function(x) prettyunits::pretty_bytes(x - 1, style="6"))) %>%
+  mutate(Library = as_code(Library)) %>%
+  select(Library, Fileformat, Compression, starts_with("write")) %>% 
+  fix_names() %>%
+  set_names(c("Library", "Fileformat", "Compression", obj_sizes$file_bytes)) %>% 
+  kable(escape = FALSE, align = "lrrlllll") %>%
+  kable_styling("hover", full_width = TRUE) %>%
+  pack_rows("<code>base</code>", 1, 3, bold = TRUE, escape = FALSE) %>%
+  pack_rows("<code>readr</code>", 4, 7, bold = TRUE, escape = FALSE) %>%
+  pack_rows("<code>fst</code>", 8, 9, bold = TRUE, escape = FALSE) %>%
+  pack_rows("<code>qs</code>", 10, 12, bold = TRUE, escape = FALSE) %>%
+  add_header_above(c(" " = 3,
+                     "tiny" = 1, "wide" = 1, "large" = 1, "flights" = 1, "tickets" = 1)) %>%
+  column_spec(c(1, 2, 3), bold = TRUE)
+```
+]
+
+---
+class: center, middle, inverse
+
+# Code Examples
+
+---
+# Code Examples
+
+.pull-left[.smaller[
+### Plain text file formats
+Package `base`: [`write.csv()`](https://www.rdocumentation.org/packages/utils/versions/3.6.2/topics/write.table) & [`read.csv()`](https://www.rdocumentation.org/packages/utils/versions/3.6.2/topics/read.table)
+```{r, eval=FALSE}
+write.csv(df, "dataset.csv")
+df2 <- read.csv("dataset.csv")
+```
+Package [`readr`](https://readr.tidyverse.org/): [`write_csv()`](https://www.rdocumentation.org/packages/readr/versions/1.3.1/topics/write_delim) & [`read_csv()`](https://www.rdocumentation.org/packages/readr/versions/1.3.1/topics/read_delim)
+```{r, eval=FALSE}
+library(readr)
+write_csv(df, "dataset.csv")
+df2 <- read_csv("dataset.csv")
+```
+Package [`data.table`](https://github.com/Rdatatable/data.table): [`fwrite()`](https://www.rdocumentation.org/packages/data.table/versions/1.12.8/topics/fwrite) & [`fread()`](https://www.rdocumentation.org/packages/data.table/versions/1.12.8/topics/fread)
+```{r, eval=FALSE}
+library(data.table)
+fwrite(df, "dataset.csv")
+df2 <- fread("dataset.csv")
+```
+Package [`vroom`](https://github.com/r-lib/vroom): [`vroom_write()`](https://www.rdocumentation.org/packages/vroom/versions/1.0.2/topics/vroom_write) & [`vroom()`](https://www.rdocumentation.org/packages/vroom/versions/1.0.2/topics/vroom)
+```{r, eval=FALSE}
+library(vroom)
+vroom_write(df, "dataset.csv")
+df2 <- vroom("dataset.csv")
+```
+]]
+
+.pull-right[.smaller[
+### `R` specific file formats
+Package `base`: [`saveRDS()` & `readRDS()`](https://www.rdocumentation.org/packages/base/versions/3.6.2/topics/readRDS) 
+```{r, eval=FALSE}
+saveRDS(df, "dataset.rds", compress = "none")
+df2 <- readRDS("dataset.rds")
+```
+Package [`readr`](https://readr.tidyverse.org/): [`write_rds()` & `read_rds()`](https://www.rdocumentation.org/packages/readr/versions/1.3.1/topics/read_rds)
+```{r, eval=FALSE}
+library(readr)
+write_rds(df, "dataset.rds", compress = "none")
+df2 <- read_rds("dataset.rds")
+```
+Package [`fst`](https://www.fstpackage.org/): [`fst_write()` & `fst_read()`](https://www.rdocumentation.org/packages/fst/versions/0.9.0/topics/write_fst)
+```{r, eval=FALSE}
+library(fst)
+write_fst(df, "dataset.fst", compression = 50)
+df2 <- read_fst("dataset.fst")
+```
+Package [`qs`](https://github.com/traversc/qs): [`qsave()`](https://www.rdocumentation.org/packages/qs/versions/0.21.1/topics/qsave) & [`qread()`](https://www.rdocumentation.org/packages/qs/versions/0.21.1/topics/qread)
+```{r, eval=FALSE}
+library(qs)
+qsave(df, "dataset.qs", preset = "high")
+df2 <- qread("dataset.qs")
+```
+]]
+
+---
+# Code Examples cont'd
+
+### `arrow` based file formats
+.pull-left[.smaller[
+Package [`feather`](https://github.com/wesm/feather): [`write_feather()` & `read_feather()`](https://www.rdocumentation.org/packages/feather/versions/0.3.5/topics/read_feather)
+```{r, eval=FALSE}
+library(feather)
+write_feather(df, "dataset.feather")
+df2 <- read_feather("dataset.feather")
+```
+Package [`arrow`](https://github.com/apache/arrow/tree/master/r): [`write_feather()`](https://www.rdocumentation.org/packages/arrow/versions/0.16.0.2/topics/write_feather) & [`read_feather()`](https://www.rdocumentation.org/packages/arrow/versions/0.16.0.2/topics/read_feather)
+```{r, eval=FALSE}
+library(arrow)
+# install_arrow()
+write_feather(df, "dataset.feather")
+df2 <- read_feather("dataset.feather")
+```
+]]
+.pull-right[.smaller[
+Package [`arrow`](https://github.com/apache/arrow/tree/master/r): [`write_arrow()`](https://www.rdocumentation.org/packages/arrow/versions/0.16.0.2/topics/write_arrow) & [`read_arrow()`](https://www.rdocumentation.org/packages/arrow/versions/0.16.0.2/topics/read_table)
+```{r, eval=FALSE}
+library(arrow)
+# install_arrow()
+write_arrow(df, "dataset.arrow")
+df2 <- read_arrow("dataset.arrow")
+```
+Package [`arrow`](https://github.com/apache/arrow/tree/master/r): [`write_parquet()`](https://www.rdocumentation.org/packages/arrow/versions/0.16.0.2/topics/write_parquet) & [`read_parquet()`](https://www.rdocumentation.org/packages/arrow/versions/0.16.0.2/topics/read_parquet)
+```{r, eval=FALSE}
+library(arrow)
+# install_arrow()
+write_parquet(df, "dataset.parquet")
+df2 < read_parquet("dataset.parquet")
+```
+]]
+
+---
+class: center, middle, inverse
+# System Information
+
+---
+
+.pull-left[
+## Hardware
+- Dell XPS 15 Laptop
+- CPU: Intel Core i7 (8th gen)
+- Model: 9750H
+- Clock speed: 2.60GHz 
+- Threads: 6 cores, 12 threads
+- RAM: 32 GB
+- SSD with ~900 MB/sec read speed
+]
+.pull-right[
+## Software Platform
+.small[
+```{r}
+sessioninfo::platform_info()
+```
+]]
+
+---
+## Benchmark package versions
+.smallest[
+```{r}
+pkgs <-  c("readr", "data.table", "vroom", "fst", "qs", "feather", "arrow")
+sessioninfo::package_info(pkgs)
+```
+]
