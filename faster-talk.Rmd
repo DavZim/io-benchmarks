@@ -299,6 +299,10 @@ deps <- tools::package_dependencies(pkgs, recursive = TRUE)
 deps
 ```
 
+<br>
+
+Source code can be found here: [https://github.com/DavZim/io-benchmarks](https://github.com/DavZim/io-benchmarks)
+
 ---
 ### Summary
 
@@ -608,7 +612,7 @@ ll$speed %>%
 ]]
 
 ---
-### RAM Usage Compression
+### Average RAM Usage Compression
 .move-upwards[.smallish[
 ```{r, echo=F}
 ll$RAM %>%
